@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2025 mohamed hamdi <haamdi@outlook.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[project]
+name = "audconv"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "auto-click-auto>=0.1.5",
+    "click>=8.2.1",
+    "pyinstaller>=6.15.0",
+    "python-magic>=0.4.27",
+    "rich>=14.1.0",
+]

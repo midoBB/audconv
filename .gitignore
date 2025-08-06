@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2025 mohamed hamdi <haamdi@outlook.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+# Pyinstaller
+main.spec
+audconv

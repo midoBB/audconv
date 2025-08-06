@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2025 mohamed hamdi <haamdi@outlook.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[tools]
+python = "3.12"
+[env._.python]
+venv = ".venv"

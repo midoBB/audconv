@@ -20,18 +20,26 @@ from rich.console import Console
 from rich.console import Group
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 ERROR_LOG = "audioconv_errors.log"
 CONVERTED_MARKER = "conv_"
 current_process = None
 current_output = None
+current_temp_file = None
 console = Console()
 
 
 def signal_handler(sig, frame):
     """Handle signals and clean up resources"""
-    global current_process, current_output
+    global current_process, current_output, current_temp_file
 
     if current_process is not None:
         # Terminate the running ffmpeg process
@@ -48,6 +56,14 @@ def signal_handler(sig, frame):
             console.print(f"\nRemoved incomplete file: {current_output}")
         except Exception as e:
             console.print(f"\nError removing incomplete file: {e}")
+
+    # Clean up temporary file
+    if current_temp_file and current_temp_file.exists():
+        try:
+            current_temp_file.unlink()
+            console.print(f"\nRemoved temporary file: {current_temp_file}")
+        except Exception as e:
+            console.print(f"\nError removing temporary file: {e}")
 
     # Remove error log if empty
     if Path(ERROR_LOG).exists() and Path(ERROR_LOG).stat().st_size == 0:
@@ -170,9 +186,11 @@ def convert_audio(
     codec: str,
     sample_rate: Optional[int],
     keep_original: bool,
+    progress: Optional[Progress] = None,
+    task_id: Optional[TaskID] = None,
 ) -> Tuple[bool, int, Optional[dict]]:
     """Convert a single audio file"""
-    global current_process, current_output
+    global current_process, current_output, current_temp_file
     temp_file = None
 
     try:
@@ -191,42 +209,83 @@ def convert_audio(
         )
         temp_path = Path(temp_file.name)
         temp_file.close()
+        current_temp_file = temp_path
 
-        # Build ffmpeg command with proper escaping
+        # Build ffmpeg command - simplified to match working bash version
         cmd = [
             "ffmpeg",
+            "-y",  # Overwrite output files without asking
             "-hide_banner",
-            "-loglevel", "error",
+            "-v", "info",  # Show some info but not too verbose
+            "-stats",
             "-i", str(file_path),
             "-c:a", codec,
             "-b:a", audio_quality,
+            str(temp_path)
         ]
-
-        # Add sample rate if specified
-        if sample_rate:
-            cmd.extend(["-ar", str(sample_rate)])
-
-        # Add format-specific options
-        if codec == "aac":
-            cmd.extend(["-movflags", "+faststart"])  # Optimize for streaming
-        elif codec == "libmp3lame":
-            cmd.extend(["-q:a", "2"])  # VBR quality setting
-        elif codec == "libopus":
-            cmd.extend(["-vbr", "on"])  # Variable bitrate
-
-        cmd.append(str(temp_path))
 
         # Run conversion
         current_process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
         )
-        stdout, stderr = current_process.communicate()
+
+        if progress and task_id and audio_info and audio_info.get("duration", 0) > 0:
+            # Track progress by parsing ffmpeg stderr output
+            duration = audio_info["duration"]
+            stderr_lines = []
+            
+            try:
+                while True:
+                    line = current_process.stderr.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    stderr_lines.append(line)
+                    
+                    # Parse time from ffmpeg progress output
+                    if "time=" in line:
+                        try:
+                            time_part = line.split("time=", 1)[1].strip()
+                            time_tokens = time_part.split()
+                            if time_tokens:
+                                time_str = time_tokens[0]
+                                # Convert time string (HH:MM:SS.ms) to seconds
+                                time_parts = time_str.split(":")
+                                if len(time_parts) == 3:
+                                    hours, minutes, seconds = time_parts
+                                    current_time = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+                                    current_percent = min(int((current_time / duration) * 100), 100)
+                                    task = next((t for t in progress.tasks if t.id == task_id), None)
+                                    if task is not None:
+                                        delta = current_percent - task.completed
+                                        if delta > 0:
+                                            progress.update(task_id, advance=delta)
+                        except (ValueError, IndexError):
+                            pass
+                
+                current_process.wait(timeout=300)  # 5 minute timeout
+                progress.update(task_id, completed=100)
+                stderr_output = "\n".join(stderr_lines)
+            except subprocess.TimeoutExpired:
+                current_process.kill()
+                current_process.wait()
+                raise Exception(f"FFmpeg conversion timed out after 5 minutes for {file_path.name}")
+        else:
+            # No progress tracking - use original method with timeout
+            try:
+                stdout, stderr_output = current_process.communicate(timeout=300)
+            except subprocess.TimeoutExpired:
+                current_process.kill()
+                current_process.wait()
+                raise Exception(f"FFmpeg conversion timed out after 5 minutes for {file_path.name}")
 
         if current_process.returncode != 0:
             raise subprocess.CalledProcessError(
-                current_process.returncode, cmd, stdout, stderr
+                current_process.returncode, cmd, stdout, stderr_output
             )
 
         # Move temp file to final location
@@ -249,6 +308,7 @@ def convert_audio(
     finally:
         current_process = None
         current_output = None
+        current_temp_file = None
 
 
 def log_error(file_path: Path, error: str):
@@ -394,8 +454,10 @@ def main(input_path, output_format, audio_quality, codec, sample_rate,
         TextColumn("[bold blue]{task.description}"),
         BarColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TextColumn("[white]{task.completed}/{task.total} files"),
+        TextColumn("[white]{task.completed}/{task.total}"),
         TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        expand=True,
     )
 
     converted = 0
@@ -456,6 +518,19 @@ def main(input_path, output_format, audio_quality, codec, sample_rate,
         statuses = {}
 
         for i, file_path in enumerate(files_to_convert):
+            # Check if file still exists before processing
+            if not file_path.exists():
+                console.print(f"[yellow]File no longer exists, skipping: {file_path.name}[/yellow]")
+                statuses[i] = "skipped"
+                progress.update(total_task, advance=1)
+                continue
+            
+            # Create individual file progress task
+            file_task = progress.add_task(
+                f"Converting {file_path.name}", total=100, start=False
+            )
+            progress.start_task(file_task)
+            
             # Update queue display
             queue_display = get_queue_display(i, files_to_convert, statuses)
             queue_display.append("")
@@ -484,6 +559,8 @@ def main(input_path, output_format, audio_quality, codec, sample_rate,
                     codec,
                     sample_rate,
                     keep_original,
+                    progress,
+                    file_task,
                 )
                 if success:
                     total_saved += size_diff
@@ -493,11 +570,16 @@ def main(input_path, output_format, audio_quality, codec, sample_rate,
                         total_duration += audio_info["duration"]
                 else:
                     statuses[i] = "skipped"
+            except FileNotFoundError:
+                console.print(f"[yellow]File was moved/deleted during processing: {file_path.name}[/yellow]")
+                statuses[i] = "skipped"
             except Exception as e:
                 log_error(file_path, str(e))
                 errors += 1
                 statuses[i] = "error"
 
+            # Remove individual file progress task and update total
+            progress.remove_task(file_task)
             progress.update(total_task, advance=1)
 
     # Print summary
